@@ -4,10 +4,12 @@ import {
   Button,
   Card,
   Col,
+  DatePicker,
   Descriptions,
   Divider,
   Form,
   Input,
+  Popconfirm,
   Row,
   Select,
   Space,
@@ -20,6 +22,7 @@ import {
 import type { ColumnsType } from 'antd/es/table';
 import { PlusOutlined, SaveOutlined, ReloadOutlined } from '@ant-design/icons';
 import { Link, useParams } from 'react-router-dom';
+import dayjs from 'dayjs';
 import MapPanel from '../components/common/MapPanel';
 import MeasureInput from '../components/common/MeasureInput';
 import StatusBadge from '../components/common/StatusBadge';
@@ -28,8 +31,10 @@ import EmptyState from '../components/common/EmptyState';
 import { usePointStore } from '../stores/pointStore';
 import { OCCUPIED_LEVELS, type Inspection, type OccupiedLevel } from '../types/inspection';
 import type { RectifyPlan } from '../types/rectify';
+import type { Outage } from '../types/outage';
 import { judgeInspection } from '../utils/routeCheck';
 import { addDays, isOverdue, todayStr } from '../utils/format';
+import { outageActiveOn } from '../utils/outage';
 
 interface InlineInspection {
   date: string;
@@ -42,15 +47,25 @@ interface InlineInspection {
   problem: string;
 }
 
+interface OutageForm {
+  startDate: string;
+  endDate: string;
+  reason: string;
+  alternatePointId: string;
+}
+
 export default function PointDetail() {
   const { id = '' } = useParams();
   const { message } = App.useApp();
   const points = usePointStore((s) => s.points);
   const inspections = usePointStore((s) => s.inspections);
   const rectifies = usePointStore((s) => s.rectifies);
+  const outages = usePointStore((s) => s.outages);
   const loaded = usePointStore((s) => s.loaded);
   const addInspection = usePointStore((s) => s.addInspection);
   const addRectify = usePointStore((s) => s.addRectify);
+  const addOutage = usePointStore((s) => s.addOutage);
+  const liftOutage = usePointStore((s) => s.liftOutage);
 
   const point = useMemo(() => points.find((p) => p.id === id), [points, id]);
   const history = useMemo(
@@ -77,6 +92,20 @@ export default function PointDetail() {
     problem: '',
   }));
   const [saving, setSaving] = useState(false);
+
+  const pointOutages = useMemo(
+    () =>
+      outages
+        .filter((o) => o.pointId === id)
+        .sort((a, b) => (a.startDate < b.startDate ? 1 : -1)),
+    [outages, id],
+  );
+  const [outageForm, setOutageForm] = useState<OutageForm>(() => ({
+    startDate: todayStr(),
+    endDate: addDays(todayStr(), 30),
+    reason: '',
+    alternatePointId: '',
+  }));
 
   const judgement = useMemo(
     () =>
@@ -154,6 +183,106 @@ export default function PointDetail() {
       message.error(`整改条目创建失败：${e instanceof Error ? e.message : String(e)}`);
     }
   };
+
+  const outageStatusOf = (o: Outage): string => {
+    if (o.actualEnd) return '已恢复';
+    return outageActiveOn(o, todayStr()) ? '停用中' : '已结束';
+  };
+
+  const handleAddOutage = async () => {
+    if (!outageForm.startDate || !outageForm.endDate) {
+      message.warning('请选择停用开始与计划恢复日期');
+      return;
+    }
+    if (outageForm.endDate < outageForm.startDate) {
+      message.warning('计划恢复日期不能早于停用开始日期');
+      return;
+    }
+    try {
+      await addOutage({
+        pointId: point.id,
+        startDate: outageForm.startDate,
+        endDate: outageForm.endDate,
+        reason: outageForm.reason.trim() || '施工停用',
+        alternatePointId: outageForm.alternatePointId,
+        actualEnd: '',
+      });
+      message.success('已登记停用期，停用期间该点位不进入路线选点链');
+      setOutageForm((c) => ({ ...c, reason: '', alternatePointId: '' }));
+    } catch (e) {
+      message.error(`停用期登记失败：${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  const handleLiftOutage = async (o: Outage) => {
+    try {
+      await liftOutage(o.id);
+      message.success('已记录实际恢复，原计划恢复日期保留；相关路线将按通行日重新计算');
+    } catch (e) {
+      message.error(`解除停用失败：${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  const outageColumns: ColumnsType<Outage> = [
+    { title: '停用开始', dataIndex: 'startDate', width: 110 },
+    {
+      title: '原计划恢复',
+      dataIndex: 'endDate',
+      width: 110,
+      render: (v: string) => <Typography.Text delete={false}>{v}</Typography.Text>,
+    },
+    {
+      title: '实际恢复',
+      dataIndex: 'actualEnd',
+      width: 170,
+      render: (v: string, row) =>
+        v ? (
+          <Space size={4}>
+            {v}
+            {v < row.endDate && <Tag color="warning">提前恢复</Tag>}
+          </Space>
+        ) : (
+          <Typography.Text type="secondary">未恢复</Typography.Text>
+        ),
+    },
+    {
+      title: '状态',
+      width: 90,
+      render: (_, row) => <StatusBadge value={outageStatusOf(row)} kind="generic" />,
+    },
+    {
+      title: '替代点',
+      dataIndex: 'alternatePointId',
+      width: 200,
+      render: (v: string) =>
+        v ? (
+          <Link to={`/points/${v}`}>{points.find((p) => p.id === v)?.name ?? v}</Link>
+        ) : (
+          <Typography.Text type="secondary">未指定</Typography.Text>
+        ),
+    },
+    { title: '停用原因', dataIndex: 'reason', ellipsis: true },
+    {
+      title: '操作',
+      width: 100,
+      render: (_, row) =>
+        row.actualEnd ? (
+          <Typography.Text type="secondary">—</Typography.Text>
+        ) : (
+          <Popconfirm
+            title="确认该点位已恢复使用？"
+            description="将记录实际恢复日，原计划恢复日期保留备查。"
+            onConfirm={() => handleLiftOutage(row)}
+            okText="确认恢复"
+            cancelText="取消"
+          >
+            <Button size="small" type="link" data-testid={`lift-outage-${row.id}`}>
+              解除停用
+            </Button>
+          </Popconfirm>
+        ),
+    },
+  ];
 
   const inspectionColumns: ColumnsType<Inspection> = [
     { title: '核验日期', dataIndex: 'date', width: 120, sorter: (a, b) => (a.date < b.date ? -1 : 1) },
@@ -404,6 +533,102 @@ export default function PointDetail() {
           </Card>
         </Col>
       </Row>
+
+      <Card
+        title="停用期与替代点"
+        size="small"
+        style={{ marginTop: 16 }}
+        extra={
+          <Typography.Text type="secondary" className="gb-muted">
+            停用期间不进入路线选点链；解除后路线按通行日自动恢复，核验与整改记录保留
+          </Typography.Text>
+        }
+      >
+        <Divider style={{ margin: '0 0 12px' }} />
+        {pointOutages.length ? (
+          <Table<Outage>
+            rowKey="id"
+            size="small"
+            pagination={{ pageSize: 5, hideOnSinglePage: true }}
+            dataSource={pointOutages}
+            columns={outageColumns}
+          />
+        ) : (
+          <EmptyState title="暂无停用记录" description="施工或临时停用时在此登记停用期与替代点" compact />
+        )}
+
+        <Divider style={{ margin: '12px 0' }} />
+        <Form layout="vertical">
+          <Row gutter={12}>
+            <Col xs={24} md={6}>
+              <Form.Item label="停用开始">
+                <DatePicker
+                  id="outage-start"
+                  value={outageForm.startDate ? dayjs(outageForm.startDate) : null}
+                  onChange={(d) =>
+                    setOutageForm((c) => ({ ...c, startDate: d ? d.format('YYYY-MM-DD') : '' }))
+                  }
+                  allowClear={false}
+                  style={{ width: '100%' }}
+                />
+              </Form.Item>
+            </Col>
+            <Col xs={24} md={6}>
+              <Form.Item label="原计划恢复">
+                <DatePicker
+                  id="outage-end"
+                  value={outageForm.endDate ? dayjs(outageForm.endDate) : null}
+                  onChange={(d) =>
+                    setOutageForm((c) => ({ ...c, endDate: d ? d.format('YYYY-MM-DD') : '' }))
+                  }
+                  allowClear={false}
+                  style={{ width: '100%' }}
+                />
+              </Form.Item>
+            </Col>
+            <Col xs={24} md={6}>
+              <Form.Item label="替代点">
+                <Select
+                  id="outage-alternate"
+                  value={outageForm.alternatePointId || undefined}
+                  onChange={(v) => setOutageForm((c) => ({ ...c, alternatePointId: v ?? '' }))}
+                  allowClear
+                  placeholder="选择同类型邻近点位"
+                  options={points
+                    .filter((p) => p.id !== point.id)
+                    .sort((a, b) =>
+                      a.facilityType === point.facilityType && b.facilityType !== point.facilityType
+                        ? -1
+                        : 1,
+                    )
+                    .map((p) => ({
+                      value: p.id,
+                      label: `${p.code} ${p.name}${p.facilityType === point.facilityType ? '（同类设施）' : ''}`,
+                    }))}
+                />
+              </Form.Item>
+            </Col>
+            <Col xs={24} md={6}>
+              <Form.Item label="停用原因">
+                <Input
+                  id="outage-reason"
+                  value={outageForm.reason}
+                  onChange={(e) => setOutageForm((c) => ({ ...c, reason: e.target.value }))}
+                  placeholder="如 坡道施工改造"
+                />
+              </Form.Item>
+            </Col>
+          </Row>
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            onClick={handleAddOutage}
+            data-testid="save-outage"
+          >
+            登记停用期
+          </Button>
+        </Form>
+      </Card>
 
       <Card title="整改跟踪" size="small" style={{ marginTop: 16 }}>
         <Divider style={{ margin: '0 0 12px' }} />

@@ -3,6 +3,7 @@ import type { AccessPoint } from '../types/point';
 import type { Inspection } from '../types/inspection';
 import type { RouteSegment } from '../types/route';
 import type { RectifyPlan } from '../types/rectify';
+import type { Outage } from '../types/outage';
 import { addDays, makeId, todayStr, toPlain } from '../utils/format';
 import { judgeInspection } from '../utils/routeCheck';
 
@@ -13,12 +14,14 @@ export const DB_NAME = 'gbaccessmap-db';
  * v1 建 points / inspections
  * v2 加 routes 表与 pointId 索引
  * v3 加 rectifies 表，并为历史不合格核验补建整改条目
+ * v4 加 outages 表（点位停用期与替代点）
  */
 class AccessMapDb extends Dexie {
   points!: Table<AccessPoint, string>;
   inspections!: Table<Inspection, string>;
   routes!: Table<RouteSegment, string>;
   rectifies!: Table<RectifyPlan, string>;
+  outages!: Table<Outage, string>;
 
   constructor() {
     super(DB_NAME);
@@ -72,6 +75,13 @@ class AccessMapDb extends Dexie {
           });
         }
       });
+    this.version(4).stores({
+      points: 'id, code, facilityType, district, name',
+      inspections: 'id, pointId, date, conclusion',
+      routes: 'id, routeName, fromPointId, toPointId, order',
+      rectifies: 'id, pointId, status, deadline',
+      outages: 'id, pointId, startDate, endDate',
+    });
   }
 }
 
@@ -297,6 +307,15 @@ const SEED_ROUTES: SeedRoute[] = [
     stepCount: 0,
     curbHeight: 2,
   },
+  {
+    // 途经西直门站无障碍电梯（pt-1003 示例停用中），替代点为鲁谷路电梯 pt-1008
+    routeName: '西直门—鲁谷无障碍通道',
+    pointIds: ['pt-1008', 'pt-1003'],
+    length: 1820,
+    obstacleCount: 0,
+    stepCount: 0,
+    curbHeight: 1.5,
+  },
 ];
 
 function buildSeed() {
@@ -386,7 +405,30 @@ function buildSeed() {
       createdAt: now,
     },
   ];
-  return { points, inspections, routes, rectifies };
+  const outages: Outage[] = [
+    {
+      id: 'out-seed-1',
+      pointId: 'pt-1003',
+      startDate: addDays(today, -10),
+      endDate: addDays(today, 20),
+      reason: '电梯井道改造施工，暂停使用',
+      alternatePointId: 'pt-1008',
+      actualEnd: '',
+      createdAt: now,
+    },
+    {
+      // 提前恢复示例：实际恢复日早于原计划，原计划保留备查
+      id: 'out-seed-2',
+      pointId: 'pt-1002',
+      startDate: addDays(today, -30),
+      endDate: addDays(today, 10),
+      reason: '路口盲道翻修施工',
+      alternatePointId: 'pt-1007',
+      actualEnd: addDays(today, -5),
+      createdAt: now,
+    },
+  ];
+  return { points, inspections, routes, rectifies, outages };
 }
 
 /** 首次打开时写入示例数据；已有数据则跳过 */
@@ -394,11 +436,12 @@ export async function ensureSeed(): Promise<void> {
   const count = await db.points.count();
   if (count > 0) return;
   const seed = toPlain(buildSeed());
-  await db.transaction('rw', db.points, db.inspections, db.routes, db.rectifies, async () => {
+  await db.transaction('rw', db.points, db.inspections, db.routes, db.rectifies, db.outages, async () => {
     await db.points.bulkPut(seed.points);
     await db.inspections.bulkPut(seed.inspections);
     await db.routes.bulkPut(seed.routes);
     await db.rectifies.bulkPut(seed.rectifies);
+    await db.outages.bulkPut(seed.outages);
   });
 }
 

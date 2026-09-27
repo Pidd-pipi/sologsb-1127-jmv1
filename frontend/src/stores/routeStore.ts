@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { db } from '../db';
 import type { AccessPoint } from '../types/point';
 import type { RouteSegment } from '../types/route';
-import { makeId, toPlain } from '../utils/format';
+import { makeId, toPlain, todayStr } from '../utils/format';
 import { judgeSegment, buildVerdict } from '../utils/routeCheck';
 import { segmentLength } from '../utils/geo';
 import type { RouteVerdict } from '../types/route';
@@ -25,11 +25,14 @@ interface RouteState {
   loading: boolean;
   error: string;
   draftName: string;
+  /** 计划通行日期，YYYY-MM-DD；落在停用期内的点位不可进入选点链 */
+  planDate: string;
   chain: string[];
   draftSegments: DraftSegment[];
   verdict: RouteVerdict | null;
   load: () => Promise<void>;
   setDraftName: (name: string) => void;
+  setPlanDate: (date: string) => void;
   setChain: (ids: string[]) => void;
   toggleChainPoint: (id: string) => void;
   buildChainSegments: (points: AccessPoint[]) => void;
@@ -37,6 +40,7 @@ interface RouteState {
   removeDraftSegment: (key: string) => void;
   computeVerdict: () => RouteVerdict;
   saveRoute: () => Promise<number>;
+  clearDraftSegments: () => void;
   resetDraft: () => void;
 }
 
@@ -50,6 +54,7 @@ export const useRouteStore = create<RouteState>((set, get) => ({
   loading: false,
   error: '',
   draftName: '无障碍通行路线',
+  planDate: todayStr(),
   chain: [],
   draftSegments: [],
   verdict: null,
@@ -71,6 +76,8 @@ export const useRouteStore = create<RouteState>((set, get) => ({
   },
 
   setDraftName: (name) => set({ draftName: name }),
+
+  setPlanDate: (date) => set({ planDate: date || todayStr(), verdict: null }),
 
   setChain: (ids) => set({ chain: ids, verdict: null }),
 
@@ -155,4 +162,7 @@ export const useRouteStore = create<RouteState>((set, get) => ({
   },
 
   resetDraft: () => set({ draftSegments: [], verdict: null, chain: [] }),
+
+  /** 作废已串联的路段草稿（计划通行日变化导致端点点位停用时使用） */
+  clearDraftSegments: () => set({ draftSegments: [], verdict: null }),
 }));

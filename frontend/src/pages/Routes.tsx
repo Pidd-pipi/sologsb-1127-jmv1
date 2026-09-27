@@ -5,6 +5,7 @@ import {
   Button,
   Card,
   Col,
+  DatePicker,
   Form,
   Input,
   InputNumber,
@@ -18,44 +19,84 @@ import {
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { DeleteOutlined, NodeIndexOutlined, SaveOutlined, ThunderboltOutlined } from '@ant-design/icons';
+import dayjs from 'dayjs';
 import StatusBadge from '../components/common/StatusBadge';
 import EmptyState from '../components/common/EmptyState';
 import { usePointStore } from '../stores/pointStore';
 import { useRouteStore, type DraftSegment } from '../stores/routeStore';
 import type { RouteSegment, RouteVerdict } from '../types/route';
 import { buildVerdict, judgeSegment, CURB_FAIL, CURB_PASS } from '../utils/routeCheck';
+import { activeOutageOn, routeOutageImpact } from '../utils/outage';
+import { todayStr } from '../utils/format';
 
 export default function Routes() {
   const { message } = App.useApp();
   const points = usePointStore((s) => s.points);
+  const outages = usePointStore((s) => s.outages);
   const {
     segments,
     draftName,
+    planDate,
     chain,
     draftSegments,
     verdict,
     setDraftName,
+    setPlanDate,
     setChain,
     buildChainSegments,
     updateDraftSegment,
     removeDraftSegment,
     computeVerdict,
     saveRoute,
+    clearDraftSegments,
     resetDraft,
   } = useRouteStore();
   const [saving, setSaving] = useState(false);
 
+  /** 计划通行日落入停用期的点位不可选，并在选项上标注停用时段 */
   const pointOptions = useMemo(
-    () => points.map((p) => ({ value: p.id, label: `${p.code} ${p.name}` })),
-    [points],
+    () =>
+      points.map((p) => {
+        const outage = activeOutageOn(outages, p.id, planDate);
+        return {
+          value: p.id,
+          disabled: Boolean(outage),
+          label: outage
+            ? `${p.code} ${p.name}（${planDate} 停用中，至 ${outage.actualEnd || outage.endDate}）`
+            : `${p.code} ${p.name}`,
+        };
+      }),
+    [points, outages, planDate],
   );
   const nameOf = (id: string) => points.find((p) => p.id === id)?.name ?? id;
 
   const draftVerdict = verdict ?? null;
 
+  /** 切换计划通行日期时，把落入停用期的点位从选点链中剔除 */
+  const handlePlanDateChange = (date: dayjs.Dayjs | null) => {
+    const next = date ? date.format('YYYY-MM-DD') : todayStr();
+    setPlanDate(next);
+    const blocked = chain.filter((id) => activeOutageOn(outages, id, next));
+    if (blocked.length) {
+      setChain(chain.filter((id) => !blocked.includes(id)));
+      // 已串联草稿可能引用被停用点位，作废后需重新串联
+      if (draftSegments.length) clearDraftSegments();
+      message.warning(
+        `${next} 处于停用期，已移出选点链：${blocked.map((id) => nameOf(id)).join('、')}，请重新串联路段`,
+      );
+    }
+  };
+
   const handleBuild = () => {
     if (chain.length < 2) {
       message.warning('请至少选择起点与终点两个点位');
+      return;
+    }
+    const blocked = chain.filter((id) => activeOutageOn(outages, id, planDate));
+    if (blocked.length) {
+      message.error(
+        `以下点位在 ${planDate} 处于停用期，不能进入选点链：${blocked.map((id) => nameOf(id)).join('、')}`,
+      );
       return;
     }
     buildChainSegments(points);
@@ -65,6 +106,17 @@ export default function Routes() {
   const handleSave = async () => {
     if (!draftSegments.length) {
       message.warning('请先串联路段');
+      return;
+    }
+    const blockedIds = new Set(
+      chain.filter((id) => activeOutageOn(outages, id, planDate)),
+    );
+    if (blockedIds.size) {
+      message.error(
+        `${planDate} 有 ${blockedIds.size} 个点位处于停用期，不能保存：${[...blockedIds]
+          .map((id) => nameOf(id))
+          .join('、')}`,
+      );
       return;
     }
     setSaving(true);
@@ -166,11 +218,21 @@ export default function Routes() {
     },
   ];
 
+  const renderPointCell = (v: string) => {
+    const outage = activeOutageOn(outages, v, planDate);
+    return (
+      <Space size={4} wrap>
+        {nameOf(v)}
+        {outage && <Tag color="error" data-testid={`saved-point-blocked-${v}`}>停用</Tag>}
+      </Space>
+    );
+  };
+
   const savedColumns: ColumnsType<RouteSegment> = [
     { title: '路线名称', dataIndex: 'routeName', width: 200 },
     { title: '段序', dataIndex: 'order', width: 70 },
-    { title: '起点', dataIndex: 'fromPointId', render: (v: string) => nameOf(v) },
-    { title: '终点', dataIndex: 'toPointId', render: (v: string) => nameOf(v) },
+    { title: '起点', dataIndex: 'fromPointId', render: renderPointCell },
+    { title: '终点', dataIndex: 'toPointId', render: renderPointCell },
     { title: '长度(m)', dataIndex: 'length', width: 100 },
     { title: '障碍数', dataIndex: 'obstacleCount', width: 90 },
     { title: '台阶数', dataIndex: 'stepCount', width: 90 },
@@ -190,10 +252,16 @@ export default function Routes() {
       list.push(s);
       byName.set(s.routeName, list);
     }
-    const rows: RouteVerdict[] = [];
-    byName.forEach((list, name) => rows.push(buildVerdict(name, list)));
+    const rows: { verdict: RouteVerdict; items: ReturnType<typeof routeOutageImpact>['items'] }[] = [];
+    byName.forEach((list, name) => {
+      const impact = routeOutageImpact(name, list, outages, points, planDate);
+      rows.push({
+        verdict: buildVerdict(name, list),
+        items: impact.items,
+      });
+    });
     return rows;
-  }, [segments]);
+  }, [segments, outages, points, planDate]);
 
   return (
     <div>
@@ -201,7 +269,7 @@ export default function Routes() {
         <div>
           <h1 className="gb-page-title">通行路线编制</h1>
           <Typography.Text type="secondary">
-            选择起点与途经点位后自动串联路段，逐段录入障碍数、台阶数与路缘高差，输出全线判定。
+            先选定计划通行日期：日期落在停用期内的设施不进入选点链；既有路线按该日期复算，命中停用即判为不可通行并给出替代点。
           </Typography.Text>
         </div>
       </div>
@@ -211,7 +279,7 @@ export default function Routes() {
           <Card title="路线编制" size="small">
             <Form layout="vertical">
               <Row gutter={12}>
-                <Col xs={24} md={10}>
+                <Col xs={24} md={8}>
                   <Form.Item label="路线名称">
                     <Input
                       id="routeName"
@@ -221,7 +289,22 @@ export default function Routes() {
                     />
                   </Form.Item>
                 </Col>
-                <Col xs={24} md={14}>
+                <Col xs={24} md={7}>
+                  <Form.Item
+                    label="计划通行日期"
+                    tooltip="日期落在停用期内的设施不会进入选点链；既有路线也按此日期复算"
+                  >
+                    <DatePicker
+                      id="planDate"
+                      value={dayjs(planDate)}
+                      onChange={handlePlanDateChange}
+                      allowClear={false}
+                      style={{ width: '100%' }}
+                      data-testid="plan-date"
+                    />
+                  </Form.Item>
+                </Col>
+                <Col xs={24} md={9}>
                   <Form.Item label="按顺序选择点位（起点 → 途经 → 终点）">
                     <Select
                       id="chain"
@@ -350,18 +433,50 @@ export default function Routes() {
             )}
           </Card>
 
-          <Card title="已编制路线判定" size="small" style={{ marginTop: 16 }}>
+          <Card
+            title={`已编制路线判定（按 ${planDate} 通行日复算）`}
+            size="small"
+            style={{ marginTop: 16 }}
+          >
             {savedVerdicts.length ? (
-              <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                {savedVerdicts.map((v) => (
-                  <Space key={v.routeName} size={8} wrap>
-                    <StatusBadge value={v.passable ? '可通行' : '不可通行'} kind="route" />
-                    <Typography.Text>{v.routeName}</Typography.Text>
-                    <Tag>{v.totalLength} m</Tag>
-                    <Tag>台阶 {v.totalSteps}</Tag>
-                    <Tag>障碍 {v.totalObstacles}</Tag>
-                  </Space>
-                ))}
+              <Space direction="vertical" size={12} style={{ width: '100%' }} data-testid="saved-verdicts">
+                {savedVerdicts.map(({ verdict: v, items }) => {
+                  const blocked = items.length > 0;
+                  const passable = v.passable && !blocked;
+                  return (
+                    <div key={v.routeName}>
+                      <Space size={8} wrap>
+                        <StatusBadge value={passable ? '可通行' : '不可通行'} kind="route" />
+                        <Typography.Text>{v.routeName}</Typography.Text>
+                        <Tag>{v.totalLength} m</Tag>
+                        <Tag>台阶 {v.totalSteps}</Tag>
+                        <Tag>障碍 {v.totalObstacles}</Tag>
+                      </Space>
+                      {blocked && (
+                        <Alert
+                          type="error"
+                          showIcon
+                          style={{ marginTop: 6 }}
+                          message={`${planDate} 通行日有 ${items.length} 处点位停用，路线不可通行`}
+                          description={
+                            <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+                              {items.map((it) => (
+                                <li key={it.pointId} data-testid={`impact-${v.routeName}-${it.pointId}`}>
+                                  第 {it.segmentOrders.join('、')} 段端点「{it.pointName}」停用
+                                  （{it.outage.startDate} ~ {it.outage.actualEnd || it.outage.endDate}
+                                  {it.outage.actualEnd ? '，已提前恢复' : ''}）
+                                  {it.alternateName
+                                    ? `，替代点：${it.alternateName}`
+                                    : '，未登记替代点'}
+                                </li>
+                              ))}
+                            </ul>
+                          }
+                        />
+                      )}
+                    </div>
+                  );
+                })}
               </Space>
             ) : (
               <EmptyState title="暂无已保存路线" compact />

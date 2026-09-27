@@ -20,6 +20,9 @@ const COLOR_MAP: Record<string, string> = {
   可通行: 'success',
   不可通行: 'error',
   未核验: 'default',
+  停用中: 'error',
+  已恢复: 'success',
+  已结束: 'default',
 };
 
 export function badgeColor(value: string): string {

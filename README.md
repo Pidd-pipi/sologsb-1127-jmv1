@@ -37,7 +37,7 @@ docker compose down
 | `/` | 核验总览：按行政区与设施类型汇总点位数、合格率、待整改数，点击统计块下钻清单 | AccessPoint / Inspection / RectifyPlan |
 | `/points/new` | 点位登记：地图打点或手填经纬度，可同时录入首次核验实测值 | AccessPoint / Inspection |
 | `/points/:id` | 点位详情：地图定位与属性、核验历史、就地新增核验、整改跟踪 | 四个模型 |
-| `/routes` | 通行路线编制：选点自动串联路段，逐段填障碍数/台阶数/路缘高差，输出全线判定 | RouteSegment / AccessPoint |
+| `/routes` | 通行路线编制：先选计划通行日期，选点自动串联路段，逐段填障碍数/台阶数/路缘高差，输出全线判定；停用期内设施不进入选点链，既有路线按通行日复算 | RouteSegment / AccessPoint / Outage |
 | `/map` | 设施地图：按设施类型着色渲染点位，点选弹出核验摘要 | AccessPoint / Inspection |
 | `/rectify` | 整改清单：按状态与期限分组、逾期置顶，登记复检结果 | RectifyPlan / AccessPoint |
 
@@ -49,13 +49,22 @@ docker compose down
 | Inspection | `src/types/inspection.ts` | 核验日期、核验人、坡度 %、净宽 cm、扶手、盲道连续性、占用情况、结论、问题描述 |
 | RouteSegment | `src/types/route.ts` | 路线名称、起点/终点点位、长度、障碍数、台阶数、路缘高差、是否可轮椅通行 |
 | RectifyPlan | `src/types/rectify.ts` | 点位 id、整改要求、责任单位、整改期限、复检日期、状态 |
+| Outage | `src/types/outage.ts` | 点位 id、停用开始、原计划恢复、实际恢复、停用原因、替代点位 id |
+
+### 停用期与路线复算
+
+- 点位详情页可登记停用段（施工等临时停用）与替代点；同一点位的停用段不允许重叠（按原计划起止校验，端点相接也算重叠）。
+- 解除停用只写「实际恢复日」，原计划恢复日期保留；提前恢复会标注「提前恢复」。
+- 路线编制必须先选**计划通行日期**：该日期落在停用期内的设施在选点链中禁选；改日期时自动移出已选停用点位并作废已串联草稿。
+- 既有路线随计划通行日期复算：命中停用的端点点位给出受影响段序、停用时段与替代点，整线判为不可通行；停用解除（含提前恢复）后同一路线重新计算自动恢复，原核验与整改记录不动。
 
 ## 数据存储
 
 - **IndexedDB（Dexie，库名 `gbaccessmap-db`）**：业务数据。含版本号与升级迁移：
   - `v1` 建 `points` / `inspections` 表；
   - `v2` 增加 `routes` 表与 `pointId` 相关索引；
-  - `v3` 增加 `rectifies` 表，并为历史「不合格」核验补建整改条目。
+  - `v3` 增加 `rectifies` 表，并为历史「不合格」核验补建整改条目；
+  - `v4` 增加 `outages` 表（点位停用期与替代点）。
 - **localStorage**：点位登记表单草稿（`gbaccessmap-draft:point-new`）与 UI 偏好（`gbaccessmap-ui`）。
 - 首次打开时自动写入一批示例数据，便于直接体验。
 - 容器无状态：不使用数据库服务、不挂载命名卷，清空浏览器存储即可重置数据。
@@ -80,7 +89,7 @@ sologsb-1127/
     ├── tsconfig*.json
     ├── public/favicon.svg
     └── src/
-        ├── types/{point,inspection,route,rectify}.ts
+        ├── types/{point,inspection,route,rectify,outage}.ts
         ├── db/index.ts                     # Dexie 封装 + 版本迁移 + 示例数据
         ├── stores/{pointStore,routeStore,uiStore}.ts
         ├── components/common/{MapPanel,StatusBadge,FacilityIcon,MeasureInput,EmptyState}.tsx
@@ -88,7 +97,7 @@ sologsb-1127/
         ├── pages/{Overview,PointNew,PointDetail,Routes,MapView,Rectify}.tsx
         ├── layouts/AppLayout.tsx
         ├── router/index.tsx
-        └── utils/{routeCheck,geo,format}.ts
+        └── utils/{routeCheck,outage,geo,format}.ts
 ```
 
 ## 判定阈值（`src/utils/routeCheck.ts`）
