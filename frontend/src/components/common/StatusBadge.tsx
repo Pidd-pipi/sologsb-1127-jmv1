@@ -19,6 +19,9 @@ const COLOR_MAP: Record<string, string> = {
   复发: 'error',
   可通行: 'success',
   不可通行: 'error',
+  停用中: 'error',
+  计划停用: 'warning',
+  已恢复: 'success',
   未核验: 'default',
 };
 

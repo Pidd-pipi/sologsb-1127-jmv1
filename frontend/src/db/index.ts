@@ -3,6 +3,7 @@ import type { AccessPoint } from '../types/point';
 import type { Inspection } from '../types/inspection';
 import type { RouteSegment } from '../types/route';
 import type { RectifyPlan } from '../types/rectify';
+import type { PointClosure } from '../types/closure';
 import { addDays, makeId, todayStr, toPlain } from '../utils/format';
 import { judgeInspection } from '../utils/routeCheck';
 
@@ -13,12 +14,14 @@ export const DB_NAME = 'gbaccessmap-db';
  * v1 建 points / inspections
  * v2 加 routes 表与 pointId 索引
  * v3 加 rectifies 表，并为历史不合格核验补建整改条目
+ * v4 加 closures 表（点位停用期与替代点）
  */
 class AccessMapDb extends Dexie {
   points!: Table<AccessPoint, string>;
   inspections!: Table<Inspection, string>;
   routes!: Table<RouteSegment, string>;
   rectifies!: Table<RectifyPlan, string>;
+  closures!: Table<PointClosure, string>;
 
   constructor() {
     super(DB_NAME);
@@ -72,6 +75,13 @@ class AccessMapDb extends Dexie {
           });
         }
       });
+    this.version(4).stores({
+      points: 'id, code, facilityType, district, name',
+      inspections: 'id, pointId, date, conclusion',
+      routes: 'id, routeName, fromPointId, toPointId, order',
+      rectifies: 'id, pointId, status, deadline',
+      closures: 'id, pointId, startDate, endDate',
+    });
   }
 }
 
@@ -386,7 +396,20 @@ function buildSeed() {
       createdAt: now,
     },
   ];
-  return { points, inspections, routes, rectifies };
+  // 示例停用：王府井盲道路口施工，计划 20 天后恢复，替代点为同类型盲道点位
+  const closures: PointClosure[] = [
+    {
+      id: 'cls-seed-1',
+      pointId: 'pt-1002',
+      startDate: addDays(today, -3),
+      endDate: addDays(today, 20),
+      actualEnd: '',
+      alternatePointId: 'pt-1007',
+      reason: '路口改造施工，盲道临时封闭',
+      createdAt: now,
+    },
+  ];
+  return { points, inspections, routes, rectifies, closures };
 }
 
 /** 首次打开时写入示例数据；已有数据则跳过 */
@@ -394,12 +417,21 @@ export async function ensureSeed(): Promise<void> {
   const count = await db.points.count();
   if (count > 0) return;
   const seed = toPlain(buildSeed());
-  await db.transaction('rw', db.points, db.inspections, db.routes, db.rectifies, async () => {
-    await db.points.bulkPut(seed.points);
-    await db.inspections.bulkPut(seed.inspections);
-    await db.routes.bulkPut(seed.routes);
-    await db.rectifies.bulkPut(seed.rectifies);
-  });
+  await db.transaction(
+    'rw',
+    db.points,
+    db.inspections,
+    db.routes,
+    db.rectifies,
+    db.closures,
+    async () => {
+      await db.points.bulkPut(seed.points);
+      await db.inspections.bulkPut(seed.inspections);
+      await db.routes.bulkPut(seed.routes);
+      await db.rectifies.bulkPut(seed.rectifies);
+      await db.closures.bulkPut(seed.closures);
+    },
+  );
 }
 
 export { makeId };

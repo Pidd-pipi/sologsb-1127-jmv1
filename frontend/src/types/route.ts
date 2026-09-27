@@ -15,6 +15,8 @@ export interface RouteSegment {
   curbHeight: number;
   /** 是否可轮椅通行（由逐段核验判定） */
   wheelchairPassable: boolean;
+  /** 计划通行日期 YYYY-MM-DD，用于停用期判定；历史数据可能为空 */
+  planDate?: string;
   /** 在整条路线中的顺序，从 1 开始 */
   order: number;
   createdAt: string;

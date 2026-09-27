@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { db } from '../db';
 import type { AccessPoint } from '../types/point';
 import type { RouteSegment } from '../types/route';
-import { makeId, toPlain } from '../utils/format';
+import { makeId, toPlain, todayStr } from '../utils/format';
 import { judgeSegment, buildVerdict } from '../utils/routeCheck';
 import { segmentLength } from '../utils/geo';
 import type { RouteVerdict } from '../types/route';
@@ -25,11 +25,14 @@ interface RouteState {
   loading: boolean;
   error: string;
   draftName: string;
+  /** 计划通行日期 YYYY-MM-DD，停用期判定与保存路线时使用 */
+  planDate: string;
   chain: string[];
   draftSegments: DraftSegment[];
   verdict: RouteVerdict | null;
   load: () => Promise<void>;
   setDraftName: (name: string) => void;
+  setPlanDate: (date: string) => void;
   setChain: (ids: string[]) => void;
   toggleChainPoint: (id: string) => void;
   buildChainSegments: (points: AccessPoint[]) => void;
@@ -50,6 +53,7 @@ export const useRouteStore = create<RouteState>((set, get) => ({
   loading: false,
   error: '',
   draftName: '无障碍通行路线',
+  planDate: todayStr(),
   chain: [],
   draftSegments: [],
   verdict: null,
@@ -71,6 +75,8 @@ export const useRouteStore = create<RouteState>((set, get) => ({
   },
 
   setDraftName: (name) => set({ draftName: name }),
+
+  setPlanDate: (date) => set({ planDate: date || todayStr(), verdict: null }),
 
   setChain: (ids) => set({ chain: ids, verdict: null }),
 
@@ -127,7 +133,7 @@ export const useRouteStore = create<RouteState>((set, get) => ({
   },
 
   saveRoute: async () => {
-    const { draftSegments, draftName } = get();
+    const { draftSegments, draftName, planDate } = get();
     const rows: RouteSegment[] = draftSegments.map((seg) =>
       toPlain({
         id: makeId('rts'),
@@ -139,6 +145,7 @@ export const useRouteStore = create<RouteState>((set, get) => ({
         stepCount: seg.stepCount,
         curbHeight: seg.curbHeight,
         wheelchairPassable: judgeSegment(seg).passable,
+        planDate: planDate || todayStr(),
         order: seg.order,
         createdAt: new Date().toISOString(),
       }),
@@ -154,5 +161,5 @@ export const useRouteStore = create<RouteState>((set, get) => ({
     return rows.length;
   },
 
-  resetDraft: () => set({ draftSegments: [], verdict: null, chain: [] }),
+  resetDraft: () => set({ draftSegments: [], verdict: null, chain: [], planDate: todayStr() }),
 }));

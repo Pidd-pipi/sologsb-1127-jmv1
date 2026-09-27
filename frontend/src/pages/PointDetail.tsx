@@ -4,10 +4,12 @@ import {
   Button,
   Card,
   Col,
+  DatePicker,
   Descriptions,
   Divider,
   Form,
   Input,
+  Modal,
   Row,
   Select,
   Space,
@@ -18,8 +20,9 @@ import {
   Typography,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
-import { PlusOutlined, SaveOutlined, ReloadOutlined } from '@ant-design/icons';
+import { PlusOutlined, SaveOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons';
 import { Link, useParams } from 'react-router-dom';
+import dayjs from 'dayjs';
 import MapPanel from '../components/common/MapPanel';
 import MeasureInput from '../components/common/MeasureInput';
 import StatusBadge from '../components/common/StatusBadge';
@@ -28,7 +31,9 @@ import EmptyState from '../components/common/EmptyState';
 import { usePointStore } from '../stores/pointStore';
 import { OCCUPIED_LEVELS, type Inspection, type OccupiedLevel } from '../types/inspection';
 import type { RectifyPlan } from '../types/rectify';
+import type { PointClosure } from '../types/closure';
 import { judgeInspection } from '../utils/routeCheck';
+import { closureEffectiveEnd, closureState, isClosedOn } from '../utils/closure';
 import { addDays, isOverdue, todayStr } from '../utils/format';
 
 interface InlineInspection {
@@ -48,9 +53,12 @@ export default function PointDetail() {
   const points = usePointStore((s) => s.points);
   const inspections = usePointStore((s) => s.inspections);
   const rectifies = usePointStore((s) => s.rectifies);
+  const closures = usePointStore((s) => s.closures);
   const loaded = usePointStore((s) => s.loaded);
   const addInspection = usePointStore((s) => s.addInspection);
   const addRectify = usePointStore((s) => s.addRectify);
+  const addClosure = usePointStore((s) => s.addClosure);
+  const liftClosure = usePointStore((s) => s.liftClosure);
 
   const point = useMemo(() => points.find((p) => p.id === id), [points, id]);
   const history = useMemo(
@@ -65,6 +73,16 @@ export default function PointDetail() {
       rectifies.filter((r) => r.pointId === id).sort((a, b) => (a.deadline < b.deadline ? -1 : 1)),
     [rectifies, id],
   );
+  const pointClosures = useMemo(
+    () =>
+      closures.filter((c) => c.pointId === id).sort((a, b) => (a.startDate < b.startDate ? 1 : -1)),
+    [closures, id],
+  );
+  /** 今天处于停用期的记录（用于页头标记） */
+  const activeClosure = useMemo(
+    () => pointClosures.find((c) => isClosedOn(c, todayStr())),
+    [pointClosures],
+  );
 
   const [form, setForm] = useState<InlineInspection>(() => ({
     date: todayStr(),
@@ -77,6 +95,17 @@ export default function PointDetail() {
     problem: '',
   }));
   const [saving, setSaving] = useState(false);
+  const [closureOpen, setClosureOpen] = useState(false);
+  const [closureForm, setClosureForm] = useState(() => ({
+    startDate: todayStr(),
+    endDate: addDays(todayStr(), 30),
+    alternatePointId: '',
+    reason: '',
+  }));
+  const [closureSaving, setClosureSaving] = useState(false);
+  const [lifting, setLifting] = useState<PointClosure | null>(null);
+  const [liftDate, setLiftDate] = useState(todayStr());
+  const [liftSaving, setLiftSaving] = useState(false);
 
   const judgement = useMemo(
     () =>
@@ -155,6 +184,46 @@ export default function PointDetail() {
     }
   };
 
+  const handleAddClosure = async () => {
+    setClosureSaving(true);
+    try {
+      await addClosure({
+        pointId: point.id,
+        startDate: closureForm.startDate,
+        endDate: closureForm.endDate,
+        actualEnd: '',
+        alternatePointId: closureForm.alternatePointId,
+        reason: closureForm.reason.trim(),
+      });
+      message.success('已登记停用，路线编制将按计划通行日期避开该点位');
+      setClosureOpen(false);
+      setClosureForm({
+        startDate: todayStr(),
+        endDate: addDays(todayStr(), 30),
+        alternatePointId: '',
+        reason: '',
+      });
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setClosureSaving(false);
+    }
+  };
+
+  const handleLiftClosure = async () => {
+    if (!lifting) return;
+    setLiftSaving(true);
+    try {
+      await liftClosure(lifting.id, liftDate);
+      message.success(`已提前恢复通行，原计划恢复日期 ${lifting.endDate} 保留备查`);
+      setLifting(null);
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLiftSaving(false);
+    }
+  };
+
   const inspectionColumns: ColumnsType<Inspection> = [
     { title: '核验日期', dataIndex: 'date', width: 120, sorter: (a, b) => (a.date < b.date ? -1 : 1) },
     { title: '核验人', dataIndex: 'inspector', width: 130 },
@@ -213,6 +282,67 @@ export default function PointDetail() {
     },
   ];
 
+  const closureColumns: ColumnsType<PointClosure> = [
+    { title: '停用开始', dataIndex: 'startDate', width: 110 },
+    { title: '计划恢复', dataIndex: 'endDate', width: 110 },
+    {
+      title: '实际恢复',
+      dataIndex: 'actualEnd',
+      width: 110,
+      render: (v: string, row) =>
+        v ? (
+          <Space size={4}>
+            {v}
+            {v < row.endDate ? <Tag color="blue">提前</Tag> : null}
+          </Space>
+        ) : (
+          <Typography.Text type="secondary">未恢复</Typography.Text>
+        ),
+    },
+    {
+      title: '替代点',
+      dataIndex: 'alternatePointId',
+      width: 200,
+      render: (v: string) => {
+        if (!v) return <Typography.Text type="secondary">未登记</Typography.Text>;
+        const alt = points.find((p) => p.id === v);
+        return alt ? <Link to={`/points/${alt.id}`}>{alt.name}</Link> : v;
+      },
+    },
+    {
+      title: '停用原因',
+      dataIndex: 'reason',
+      ellipsis: true,
+      render: (v: string) => v || <Typography.Text type="secondary">—</Typography.Text>,
+    },
+    {
+      title: '状态',
+      key: 'state',
+      width: 100,
+      render: (_, row) => <StatusBadge value={closureState(row)} kind="generic" />,
+    },
+    {
+      title: '操作',
+      key: 'action',
+      width: 110,
+      render: (_, row) =>
+        closureState(row) === '停用中' ? (
+          <Button
+            size="small"
+            type="primary"
+            ghost
+            onClick={() => {
+              setLifting(row);
+              setLiftDate(todayStr());
+            }}
+            data-testid={`lift-closure-${row.id}`}
+          >
+            提前恢复
+          </Button>
+        ) : null,
+    },
+  ];
+
   const latest = history[0];
 
   return (
@@ -225,9 +355,15 @@ export default function PointDetail() {
               {point.name}
             </h1>
             <StatusBadge value={latest?.conclusion ?? '未核验'} kind="conclusion" bordered />
+            {activeClosure ? <StatusBadge value="停用中" kind="generic" bordered /> : null}
           </Space>
           <Typography.Text type="secondary">
             {point.code} · {point.district} · {point.location || '未填写所在道路或建筑'}
+            {activeClosure
+              ? ` · 停用至 ${closureEffectiveEnd(activeClosure)}${
+                  activeClosure.reason ? `（${activeClosure.reason}）` : ''
+                }`
+              : ''}
           </Typography.Text>
         </div>
         <Space>
@@ -422,6 +558,130 @@ export default function PointDetail() {
           />
         )}
       </Card>
+
+      <Card
+        title="停用管理"
+        size="small"
+        style={{ marginTop: 16 }}
+        extra={
+          <Button
+            type="primary"
+            icon={<StopOutlined />}
+            onClick={() => setClosureOpen(true)}
+            data-testid="open-closure-modal"
+          >
+            登记停用
+          </Button>
+        }
+      >
+        <Typography.Text type="secondary" className="gb-muted">
+          施工停用期间，路线编制按计划通行日期自动避开该点位；提前恢复只登记实际日期，原计划保留。
+        </Typography.Text>
+        <Divider style={{ margin: '12px 0' }} />
+        {pointClosures.length ? (
+          <Table<PointClosure>
+            rowKey="id"
+            size="small"
+            pagination={false}
+            dataSource={pointClosures}
+            columns={closureColumns}
+          />
+        ) : (
+          <EmptyState title="暂无停用记录" description="点位施工停用时点击右上角「登记停用」" compact />
+        )}
+      </Card>
+
+      <Modal
+        title={`登记停用 · ${point.name}`}
+        open={closureOpen}
+        onCancel={() => setClosureOpen(false)}
+        onOk={handleAddClosure}
+        confirmLoading={closureSaving}
+        okText="保存停用记录"
+        destroyOnClose
+      >
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <div>
+            <Typography.Text>停用开始日期</Typography.Text>
+            <DatePicker
+              style={{ width: '100%', marginTop: 4 }}
+              value={closureForm.startDate ? dayjs(closureForm.startDate) : null}
+              onChange={(d) =>
+                setClosureForm((c) => ({ ...c, startDate: d ? d.format('YYYY-MM-DD') : '' }))
+              }
+              data-testid="closure-start"
+            />
+          </div>
+          <div>
+            <Typography.Text>计划恢复日期</Typography.Text>
+            <DatePicker
+              style={{ width: '100%', marginTop: 4 }}
+              value={closureForm.endDate ? dayjs(closureForm.endDate) : null}
+              onChange={(d) =>
+                setClosureForm((c) => ({ ...c, endDate: d ? d.format('YYYY-MM-DD') : '' }))
+              }
+              data-testid="closure-end"
+            />
+          </div>
+          <div>
+            <Typography.Text>替代点（停用期间建议改用的点位）</Typography.Text>
+            <Select
+              style={{ width: '100%', marginTop: 4 }}
+              allowClear
+              placeholder="选择替代点位，可为空"
+              value={closureForm.alternatePointId || undefined}
+              onChange={(v) => setClosureForm((c) => ({ ...c, alternatePointId: v ?? '' }))}
+              options={points
+                .filter((p) => p.id !== point.id)
+                .map((p) => ({
+                  value: p.id,
+                  label: `${p.code} ${p.name}（${p.facilityType}）`,
+                }))}
+              data-testid="closure-alternate"
+            />
+          </div>
+          <div>
+            <Typography.Text>停用原因</Typography.Text>
+            <Input.TextArea
+              rows={2}
+              style={{ marginTop: 4 }}
+              value={closureForm.reason}
+              onChange={(e) => setClosureForm((c) => ({ ...c, reason: e.target.value }))}
+              placeholder="如：路口改造施工，设施临时封闭"
+            />
+          </div>
+          <Typography.Text type="secondary" className="gb-muted">
+            同一点位的停用段不允许重叠，保存时会自动校验。
+          </Typography.Text>
+        </Space>
+      </Modal>
+
+      <Modal
+        title={lifting ? `提前恢复 · ${point.name}` : '提前恢复'}
+        open={Boolean(lifting)}
+        onCancel={() => setLifting(null)}
+        onOk={handleLiftClosure}
+        confirmLoading={liftSaving}
+        okText="确认恢复"
+        destroyOnClose
+      >
+        {lifting ? (
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <Typography.Text type="secondary">
+              停用段 {lifting.startDate} ~ {lifting.endDate}（原计划恢复 {lifting.endDate} 将保留备查）
+            </Typography.Text>
+            <div>
+              <Typography.Text>实际恢复日期</Typography.Text>
+              <DatePicker
+                style={{ width: '100%', marginTop: 4 }}
+                value={liftDate ? dayjs(liftDate) : null}
+                onChange={(d) => setLiftDate(d ? d.format('YYYY-MM-DD') : todayStr())}
+                data-testid="lift-date"
+              />
+            </div>
+          </Space>
+        ) : null}
+      </Modal>
     </div>
   );
 }

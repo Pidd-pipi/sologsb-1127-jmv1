@@ -5,6 +5,7 @@ import {
   Button,
   Card,
   Col,
+  DatePicker,
   Form,
   Input,
   InputNumber,
@@ -18,23 +19,35 @@ import {
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { DeleteOutlined, NodeIndexOutlined, SaveOutlined, ThunderboltOutlined } from '@ant-design/icons';
+import dayjs from 'dayjs';
 import StatusBadge from '../components/common/StatusBadge';
 import EmptyState from '../components/common/EmptyState';
 import { usePointStore } from '../stores/pointStore';
 import { useRouteStore, type DraftSegment } from '../stores/routeStore';
 import type { RouteSegment, RouteVerdict } from '../types/route';
+import type { PointClosure } from '../types/closure';
 import { buildVerdict, judgeSegment, CURB_FAIL, CURB_PASS } from '../utils/routeCheck';
+import {
+  closureEffectiveEnd,
+  isClosedOn,
+  routeClosureImpacts,
+  type ClosureImpact,
+} from '../utils/closure';
+import { todayStr } from '../utils/format';
 
 export default function Routes() {
   const { message } = App.useApp();
   const points = usePointStore((s) => s.points);
+  const closures = usePointStore((s) => s.closures);
   const {
     segments,
     draftName,
+    planDate,
     chain,
     draftSegments,
     verdict,
     setDraftName,
+    setPlanDate,
     setChain,
     buildChainSegments,
     updateDraftSegment,
@@ -45,17 +58,62 @@ export default function Routes() {
   } = useRouteStore();
   const [saving, setSaving] = useState(false);
 
+  /** 计划通行日期当天处于停用期的点位 */
+  const closedOnPlan = useMemo(() => {
+    const map = new Map<string, PointClosure>();
+    for (const c of closures) {
+      if (isClosedOn(c, planDate) && !map.has(c.pointId)) map.set(c.pointId, c);
+    }
+    return map;
+  }, [closures, planDate]);
+
   const pointOptions = useMemo(
-    () => points.map((p) => ({ value: p.id, label: `${p.code} ${p.name}` })),
-    [points],
+    () =>
+      points.map((p) => {
+        const cl = closedOnPlan.get(p.id);
+        return {
+          value: p.id,
+          label: cl
+            ? `${p.code} ${p.name}（${planDate} 停用，至 ${closureEffectiveEnd(cl)}）`
+            : `${p.code} ${p.name}`,
+          disabled: Boolean(cl),
+        };
+      }),
+    [points, closedOnPlan, planDate],
   );
   const nameOf = (id: string) => points.find((p) => p.id === id)?.name ?? id;
 
+  /** 选点链中仍残留的停用点（例如改日期后未重选） */
+  const chainClosedIds = useMemo(() => chain.filter((id) => closedOnPlan.has(id)), [chain, closedOnPlan]);
+
+  /** 编制中路段的停用影响 */
+  const draftImpacts = useMemo(
+    () => routeClosureImpacts(draftSegments, closures, planDate),
+    [draftSegments, closures, planDate],
+  );
+
+  const impactText = (imp: ClosureImpact, date: string) => {
+    const alt = imp.closure.alternatePointId ? nameOf(imp.closure.alternatePointId) : '';
+    return (
+      `第 ${imp.orders.join('、')} 段端点「${nameOf(imp.pointId)}」在 ${date} 处于停用期` +
+      `（${imp.closure.startDate} ~ ${closureEffectiveEnd(imp.closure)}` +
+      `${imp.closure.reason ? `，${imp.closure.reason}` : ''}）` +
+      (alt ? `，替代点：${alt}` : '，未登记替代点')
+    );
+  };
+
   const draftVerdict = verdict ?? null;
+  const draftBlocked = draftImpacts.length > 0;
 
   const handleBuild = () => {
     if (chain.length < 2) {
       message.warning('请至少选择起点与终点两个点位');
+      return;
+    }
+    if (chainClosedIds.length) {
+      message.error(
+        `计划通行日期 ${planDate} 内「${chainClosedIds.map(nameOf).join('、')}」停用，请改选替代点`,
+      );
       return;
     }
     buildChainSegments(points);
@@ -67,10 +125,14 @@ export default function Routes() {
       message.warning('请先串联路段');
       return;
     }
+    if (draftBlocked) {
+      message.error('计划通行日期内有点位停用，请调整日期或改选替代点后再保存');
+      return;
+    }
     setSaving(true);
     try {
       const n = await saveRoute();
-      message.success(`已保存 ${n} 段路线`);
+      message.success(`已保存 ${n} 段路线（计划通行日期 ${planDate}）`);
       resetDraft();
     } catch (e) {
       message.error(`路线保存失败：${e instanceof Error ? e.message : String(e)}`);
@@ -176,6 +238,12 @@ export default function Routes() {
     { title: '台阶数', dataIndex: 'stepCount', width: 90 },
     { title: '路缘高差(cm)', dataIndex: 'curbHeight', width: 120 },
     {
+      title: '计划通行日期',
+      dataIndex: 'planDate',
+      width: 130,
+      render: (v: string) => v || <Typography.Text type="secondary">未指定</Typography.Text>,
+    },
+    {
       title: '可轮椅通行',
       dataIndex: 'wheelchairPassable',
       width: 120,
@@ -183,17 +251,25 @@ export default function Routes() {
     },
   ];
 
-  const savedVerdicts = useMemo(() => {
+  /** 已保存路线按各自的计划通行日期（历史数据回退为今天）做停用影响判定 */
+  const savedRows = useMemo(() => {
     const byName = new Map<string, RouteSegment[]>();
     for (const s of segments) {
       const list = byName.get(s.routeName) ?? [];
       list.push(s);
       byName.set(s.routeName, list);
     }
-    const rows: RouteVerdict[] = [];
-    byName.forEach((list, name) => rows.push(buildVerdict(name, list)));
+    const rows: { verdict: RouteVerdict; impacts: ClosureImpact[]; date: string }[] = [];
+    byName.forEach((list, name) => {
+      const date = list.find((s) => s.planDate)?.planDate || todayStr();
+      rows.push({
+        verdict: buildVerdict(name, list),
+        impacts: routeClosureImpacts(list, closures, date),
+        date,
+      });
+    });
     return rows;
-  }, [segments]);
+  }, [segments, closures]);
 
   return (
     <div>
@@ -201,7 +277,7 @@ export default function Routes() {
         <div>
           <h1 className="gb-page-title">通行路线编制</h1>
           <Typography.Text type="secondary">
-            选择起点与途经点位后自动串联路段，逐段录入障碍数、台阶数与路缘高差，输出全线判定。
+            选定计划通行日期后选点自动串联路段；落在停用期内的点位不可选，已保存路线按计划日期重算通行性。
           </Typography.Text>
         </div>
       </div>
@@ -211,7 +287,7 @@ export default function Routes() {
           <Card title="路线编制" size="small">
             <Form layout="vertical">
               <Row gutter={12}>
-                <Col xs={24} md={10}>
+                <Col xs={24} md={8}>
                   <Form.Item label="路线名称">
                     <Input
                       id="routeName"
@@ -221,7 +297,19 @@ export default function Routes() {
                     />
                   </Form.Item>
                 </Col>
-                <Col xs={24} md={14}>
+                <Col xs={24} md={6}>
+                  <Form.Item label="计划通行日期">
+                    <DatePicker
+                      id="planDate"
+                      style={{ width: '100%' }}
+                      value={planDate ? dayjs(planDate) : null}
+                      onChange={(d) => setPlanDate(d ? d.format('YYYY-MM-DD') : '')}
+                      allowClear={false}
+                      data-testid="plan-date"
+                    />
+                  </Form.Item>
+                </Col>
+                <Col xs={24} md={10}>
                   <Form.Item label="按顺序选择点位（起点 → 途经 → 终点）">
                     <Select
                       id="chain"
@@ -236,6 +324,18 @@ export default function Routes() {
                   </Form.Item>
                 </Col>
               </Row>
+              {chainClosedIds.length ? (
+                <Alert
+                  type="error"
+                  showIcon
+                  style={{ marginBottom: 12 }}
+                  message={`计划通行日期 ${planDate} 内有点位停用`}
+                  description={`「${chainClosedIds
+                    .map(nameOf)
+                    .join('、')}」在 ${planDate} 处于停用期，请从选点链中移除并改选替代点。`}
+                  data-testid="chain-closed-alert"
+                />
+              ) : null}
               <Space wrap>
                 <Button
                   type="primary"
@@ -299,13 +399,14 @@ export default function Routes() {
               <Space direction="vertical" size={12} style={{ width: '100%' }}>
                 <Space size={8} wrap>
                   <StatusBadge
-                    value={draftVerdict.passable ? '可通行' : '不可通行'}
+                    value={draftVerdict.passable && !draftBlocked ? '可通行' : '不可通行'}
                     kind="route"
                     bordered
                   />
                   <Typography.Text strong data-testid="verdict-name">
                     {draftVerdict.routeName}
                   </Typography.Text>
+                  <Tag>计划通行 {planDate}</Tag>
                 </Space>
                 <Row gutter={12}>
                   <Col span={12}>
@@ -321,7 +422,7 @@ export default function Routes() {
                     <Statistic title="最大路缘高差" value={draftVerdict.maxCurbHeight} suffix="cm" />
                   </Col>
                 </Row>
-                {draftVerdict.passable ? (
+                {draftVerdict.passable && !draftBlocked ? (
                   <Alert type="success" showIcon message="全线满足轮椅通行条件" />
                 ) : (
                   <Alert
@@ -332,6 +433,9 @@ export default function Routes() {
                       <ul style={{ margin: 0, paddingInlineStart: 18 }}>
                         {draftVerdict.reasons.map((r) => (
                           <li key={r}>{r}</li>
+                        ))}
+                        {draftImpacts.map((imp) => (
+                          <li key={`closure-${imp.pointId}`}>{impactText(imp, planDate)}</li>
                         ))}
                       </ul>
                     }
@@ -351,16 +455,38 @@ export default function Routes() {
           </Card>
 
           <Card title="已编制路线判定" size="small" style={{ marginTop: 16 }}>
-            {savedVerdicts.length ? (
-              <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                {savedVerdicts.map((v) => (
-                  <Space key={v.routeName} size={8} wrap>
-                    <StatusBadge value={v.passable ? '可通行' : '不可通行'} kind="route" />
-                    <Typography.Text>{v.routeName}</Typography.Text>
-                    <Tag>{v.totalLength} m</Tag>
-                    <Tag>台阶 {v.totalSteps}</Tag>
-                    <Tag>障碍 {v.totalObstacles}</Tag>
-                  </Space>
+            {savedRows.length ? (
+              <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                {savedRows.map(({ verdict: v, impacts, date }) => (
+                  <div key={v.routeName}>
+                    <Space size={8} wrap>
+                      <StatusBadge
+                        value={v.passable && !impacts.length ? '可通行' : '不可通行'}
+                        kind="route"
+                      />
+                      <Typography.Text>{v.routeName}</Typography.Text>
+                      <Tag>计划通行 {date}</Tag>
+                      <Tag>{v.totalLength} m</Tag>
+                      <Tag>台阶 {v.totalSteps}</Tag>
+                      <Tag>障碍 {v.totalObstacles}</Tag>
+                    </Space>
+                    {impacts.length ? (
+                      <Alert
+                        type="error"
+                        showIcon
+                        style={{ marginTop: 8 }}
+                        message="路线受点位停用影响，判为不可通行"
+                        description={
+                          <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+                            {impacts.map((imp) => (
+                              <li key={`saved-closure-${imp.pointId}`}>{impactText(imp, date)}</li>
+                            ))}
+                          </ul>
+                        }
+                        data-testid={`saved-impacts-${v.routeName}`}
+                      />
+                    ) : null}
+                  </div>
                 ))}
               </Space>
             ) : (
